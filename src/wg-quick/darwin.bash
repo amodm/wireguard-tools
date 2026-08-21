@@ -4,11 +4,20 @@
 # Copyright (C) 2015-2026 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
 #
 
+# if zsh exists, use that instead of bash
+if [ ! -z "$BASH_VERSION" -a -x /bin/zsh ]; then
+	exec /bin/zsh "$0" "$@"
+fi
+
 set -e -o pipefail
-shopt -s extglob
+if [ -z "$BASH_VERSION" ]; then
+	setopt KSH_GLOB
+else
+	shopt -s extglob
+fi
 export LC_ALL=C
 
-SELF="${BASH_SOURCE[0]}"
+SELF="${BASH_SOURCE[0]:-${(%):-%x}}"
 [[ $SELF == */* ]] || SELF="./$SELF"
 SELF="$(cd "${SELF%/*}" && pwd -P)/${SELF##*/}"
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:${SELF%/*}:$PATH"
@@ -39,9 +48,11 @@ die() {
 	exit 1
 }
 
-[[ ${BASH_VERSINFO[0]} -ge 4 ]] || die "Version mismatch: bash ${BASH_VERSINFO[0]} detected, when bash 4+ required"
+if [ ! -z "$BASH_VERSION" ]; then
+	[[ ${BASH_VERSINFO[0]} -ge 4 ]] || die "Version mismatch: bash ${BASH_VERSINFO[0]} detected, when bash 4+ required"
+fi
 
-CONFIG_SEARCH_PATHS=( /etc/wireguard /usr/local/etc/wireguard )
+CONFIG_SEARCH_PATHS=( "$WG_CONFIG_DIR" /etc/wireguard /usr/local/etc/wireguard )
 
 parse_options() {
 	local interface_section=0 line key value stripped path v
@@ -55,9 +66,13 @@ parse_options() {
 	[[ -e $CONFIG_FILE ]] || die "\`$CONFIG_FILE' does not exist"
 	[[ $CONFIG_FILE =~ (^|/)([a-zA-Z0-9_=+.-]{1,15})\.conf$ ]] || die "The config file must be a valid interface name, followed by .conf"
 	CONFIG_FILE="$(cd "${CONFIG_FILE%/*}" && pwd -P)/${CONFIG_FILE##*/}"
-	((($(stat -f '0%#p' "$CONFIG_FILE") & $(stat -f '0%#p' "${CONFIG_FILE%/*}") & 0007) == 0)) || echo "Warning: \`$CONFIG_FILE' is world accessible" >&2
-	INTERFACE="${BASH_REMATCH[2]}"
-	shopt -s nocasematch
+	((($(/usr/bin/stat -f '0%#p' "$CONFIG_FILE") & $(/usr/bin/stat -f '0%#p' "${CONFIG_FILE%/*}") & 0007) == 0)) || echo "Warning: \`$CONFIG_FILE' is world accessible" >&2
+	INTERFACE="${BASH_REMATCH[2]:-${match[2]}}"
+	if [ -z "$ZSH_VERSION" ]; then
+		shopt -s nocasematch
+	else
+		setopt NO_CASE_MATCH
+	fi
 	while read -r line || [[ -n $line ]]; do
 		stripped="${line%%\#*}"
 		key="${stripped%%=*}"; key="${key##*([[:space:]])}"; key="${key%%*([[:space:]])}"
@@ -70,7 +85,8 @@ parse_options() {
 			Address) ADDRESSES+=( ${value//,/ } ); continue ;;
 			MTU) MTU="$value"; continue ;;
 			DNS) for v in ${value//,/ }; do
-				[[ $v =~ (^[0-9.]+$)|(^.*:.*$) ]] && DNS+=( $v ) || DNS_SEARCH+=( $v )
+				pat='(^[0-9.]+$)|(^.*:.*$)'
+				[[ $v =~ $pat ]] && DNS+=( $v ) || DNS_SEARCH+=( $v )
 			done; continue ;;
 			Table) TABLE="$value"; continue ;;
 			PreUp) PRE_UP+=( "$unstripped_value" ); continue ;;
@@ -82,7 +98,11 @@ parse_options() {
 		fi
 		WG_CONFIG+="$line"$'\n'
 	done < "$CONFIG_FILE"
-	shopt -u nocasematch
+	if [ -z "$ZSH_VERSION" ]; then
+		shopt -u nocasematch
+	else
+		unsetopt NO_CASE_MATCH
+	fi
 }
 
 detect_launchd() {
@@ -216,8 +236,14 @@ collect_endpoints() {
 	done < <(wg show "$REAL_INTERFACE" endpoints)
 }
 
-declare -A SERVICE_DNS
-declare -A SERVICE_DNS_SEARCH
+if [[ "$SHELL" =~ ^.+\/zsh$ ]]; then
+	typeset -A SERVICE_DNS
+	typeset -A SERVICE_DNS_SEARCH
+else
+	declare -A SERVICE_DNS
+	declare -A SERVICE_DNS_SEARCH
+fi
+
 collect_new_service_dns() {
 	local service get_response
 	local -A found_services
@@ -461,9 +487,15 @@ cmd_up() {
 	done
 	set_mtu
 	up_if
-	for i in $(while read -r _ i; do for i in $i; do [[ $i =~ ^[0-9a-z:.]+/[0-9]+$ ]] && echo "$i"; done; done < <(wg show "$REAL_INTERFACE" allowed-ips) | sort -nr -k 2 -t /); do
-		add_route "$i"
-	done
+	if [ -z "$ZSH_VERSION" ]; then
+		for i in $(while read -r _ i; do for i in $i; do [[ $i =~ ^[0-9a-z:.]+/[0-9]+$ ]] && echo "$i"; done; done < <(wg show "$REAL_INTERFACE" allowed-ips) | sort -nr -k 2 -t /); do
+			add_route "$i"
+		done
+	else
+		for i in $(while read -r _ i; do for i in ${=i}; do [[ $i =~ ^[0-9a-z:.]+/[0-9]+$ ]] && echo "$i"; done; done < <(wg show "$REAL_INTERFACE" allowed-ips) | sort -nr -k 2 -t /); do
+			add_route "$i"
+		done
+	fi
 	[[ $AUTO_ROUTE4 -eq 1 || $AUTO_ROUTE6 -eq 1 ]] && set_endpoint_direct_route
 	[[ ${#DNS[@]} -gt 0 ]] && set_dns
 	monitor_daemon
